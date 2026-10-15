@@ -1,0 +1,111 @@
+import java.security.MessageDigest
+
+// Lightweight heuristic source/file scanner. It reports findings in Gradle's Build output.
+tasks.register("qualityGuardScan") {
+    group = "verification"
+    description = "Scans Android source/resources for common performance and quality risks."
+    doLast {
+        // Scan all Android source sets (main/debug/release/test) so assets and res/drawable
+        // are both included. Restrict scanning to src folders to avoid build outputs.
+        def roots = subprojects.collectMany { sp ->
+            def src = new File(sp.projectDir, "src")
+            src.exists() ? src.listFiles()?.findAll { it.isDirectory() } ?: [] : []
+        }.findAll { it.exists() }
+        def projectRoot = rootProject.projectDir.canonicalFile
+        def displayPath = { File f -> projectRoot.toPath().relativize(f.canonicalFile.toPath()).toString().replace('\\', '/') }
+        def sourceFiles = roots.collectMany { root ->
+            root.isDirectory() ? fileTree(root).matching { include '**/*.xml', '**/*.kt', '**/*.java', '**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.webp', '**/*.gif', '**/*.json', '**/*.svg', '**/*.lottie', '**/*.apng', '**/*.bmp', '**/*.tif', '**/*.tiff', '**/*.avif', '**/*.mp4', '**/*.webm', '**/*.riv', '**/*.tgs' }.files : []
+        }
+        def findings = []
+        def hash = { File f ->
+            MessageDigest.getInstance("SHA-256").digest(f.bytes).encodeHex().toString()
+        }
+
+        sourceFiles.findAll { it.name.toLowerCase(Locale.ROOT).endsWith('.xml') && it.parentFile.name.equalsIgnoreCase('layout') }.each { f ->
+            def text = f.getText('UTF-8')
+            def tags = (text =~ /<([A-Za-z][A-Za-z0-9_.]*)\b/).count
+            def depth = 0; def maxDepth = 0
+            (text =~ /<\/?[A-Za-z][^>]*>/).each { m ->
+                def token = m[0]
+                if (token.startsWith('</')) depth = Math.max(0, depth - 1)
+                else if (!(token.endsWith('/>') || token.startsWith('<?') || token.startsWith('<!'))) { depth++; maxDepth = Math.max(maxDepth, depth) }
+            }
+            if (tags >= 50 || maxDepth >= 8) findings << "[PG001] file=${displayPath(f)} | resource=${f.name} | $tags XML tags, estimated nesting depth $maxDepth. Consider flattening the layout."
+            if ((text =~ /<\s*(ScrollView|androidx\.core\.widget\.NestedScrollView|androidx\.recyclerview\.widget\.RecyclerView)/).count > 1) findings << "[PG004] file=${displayPath(f)} | resource=${f.name} | multiple scrolling widgets in one layout; review nested scrolling."
+        }
+
+        sourceFiles.findAll { f -> f.isFile() && ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.json', '.lottie', '.apng', '.bmp', '.tif', '.tiff', '.avif', '.mp4', '.webm', '.riv', '.tgs', '.svg'].any { f.name.toLowerCase(Locale.ROOT).endsWith(it) } }.each { f ->
+            def lowerName = f.name.toLowerCase(Locale.ROOT)
+            def isAnimationOrJson = ['.json', '.lottie', '.riv', '.tgs', '.gif', '.apng', '.mp4', '.webm'].any { lowerName.endsWith(it) }
+            long limit = isAnimationOrJson ? 512L * 1024 : 1L * 1024 * 1024
+            if (f.length() > limit) findings << "[PG002] file=${displayPath(f)} | resource=${f.name} | size=${String.format('%.1f', f.length()/1024.0)} KB; threshold=${limit/1024} KB. Compress, resize, or lazy-load it."
+        }
+
+        def resourceFiles = sourceFiles.findAll { f -> f.isFile() && (f.name.toLowerCase(Locale.ROOT).endsWith('.xml') || f.name.toLowerCase(Locale.ROOT).endsWith('.svg')) && (f.path.replace('\\', '/').contains('/res/') || f.name.toLowerCase(Locale.ROOT).endsWith('.svg')) }
+        resourceFiles.groupBy { hash(it) }.findAll { key, files -> files.size() > 1 }.each { key, files ->
+            findings << "[PG005] Identical resource contents found: ${files.collect { displayPath(it) + " (resource=" + it.name + ")" }.join(', ')}. Reuse one resource where appropriate."
+        }
+
+        def kotlinFiles = sourceFiles.findAll { it.name.toLowerCase(Locale.ROOT).endsWith('.kt') || it.name.toLowerCase(Locale.ROOT).endsWith('.java') }
+        def methods = [:].withDefault { [] }
+        kotlinFiles.each { f ->
+            def content = f.getText('UTF-8')
+            // Heuristic: exact normalized single-line function declarations with simple bodies only.
+            (content =~ /(?m)^\s*(?:private|internal|public|protected)?\s*(?:fun|void)\s+\w+\s*\([^\n]*\)\s*\{[^\n{}]*\}/).each { match ->
+                def normalized = match.toString().replaceAll(/\s+/, ' ').trim().replaceAll(/fun\s+\w+|void\s+\w+/, 'FUNCTION')
+                methods[normalized] << "${displayPath(f)} (${f.name}): ${match.toString().trim()}"
+            }
+        }
+        methods.findAll { key, values -> values.size() > 1 }.each { key, values ->
+            findings << "[PG006] Possible exact duplicate simple utility implementation: ${values.collect { it.substring(0, it.indexOf(': ' ) > 0 ? it.indexOf(': ' ) : it.length()) }.unique().join(', ')}. Verify manually."
+        }
+
+        // Generate an Android asset consumed by the runtime library. This bridges the
+        // development-machine scan to app Logcat after the app is installed and launched.
+        def sampleApp = rootProject.findProject(':sample-app')
+        if (sampleApp != null) {
+            def generatedAssets = new File(sampleApp.buildDir, 'generated/qualityGuard/assets')
+            generatedAssets.mkdirs()
+            def reportFile = new File(generatedAssets, 'qualityguard-findings.txt')
+            def reportLines = findings.isEmpty()
+                ? ['No PG001/PG002/PG004/PG005/PG006 findings matched the current heuristic scan.']
+                : findings
+            reportFile.setText(reportLines.join('\n') + '\n', 'UTF-8')
+            println "Generated Logcat report asset: ${reportFile}"
+        }
+
+        println "\n========== Android Performance & Quality Guard =========="
+        if (findings.isEmpty()) println "No findings matched the current heuristic rules. This does not guarantee the project is issue-free."
+        else findings.each { println it }
+        println "Scanned ${sourceFiles.size()} source/resource files; found ${findings.size()} potential issue(s)."
+        println "Paths are project-relative; scanning includes res/drawable, mipmap, raw, assets, and other src source-set folders."
+        println "The generated report is packaged into sample-app and logged by QualityGuard.start() on app launch."
+        println "Note: PG003 API burst detection runs at runtime via QualityGuard.recordApiCall(screenName, endpoint)."
+        println "=========================================================\n"
+    }
+}
+
+
+// Automatically run the source/resource scan whenever an Android module is built.
+// This makes findings appear in Android Studio's Build output without requiring
+// the developer to run `qualityGuardScan` manually.
+subprojects { subproject ->
+    subproject.tasks.matching { it.name == 'preBuild' }.configureEach {
+        dependsOn(rootProject.tasks.named('qualityGuardScan'))
+    }
+}
+
+// Package the scanner's generated report as an app asset. The scanner task runs before
+// asset merge, so the installed sample app can print the real scan findings to Logcat.
+subprojects { subproject ->
+    if (subproject.name == 'sample-app') {
+        subproject.plugins.withId('com.android.application') {
+            subproject.android.sourceSets.main.assets.srcDir(
+                new File(subproject.buildDir, 'generated/qualityGuard/assets')
+            )
+        }
+        subproject.tasks.matching { it.name.startsWith('merge') && it.name.endsWith('Assets') }.configureEach {
+            dependsOn(rootProject.tasks.named('qualityGuardScan'))
+        }
+    }
+}
